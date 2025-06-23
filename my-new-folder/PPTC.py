@@ -29,28 +29,29 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 # ===================================================================================== #
 mqtt_data = {}
 tc_threshold = -9
+is_game_ended = {}
 console = Console()
 qualified_tables = {}
+matched_seat_ev = None
 has_auto_selected = False
-selected_table_name = None
-custom_panel_override = None
-ev2_custom_rendered = False
 matched_seat_index = None
 matched_seat_score = None
-matched_seat_ev = None
-is_game_ended = {}
+selected_table_name = None
+ev2_custom_rendered = False
+custom_panel_override = None
+
+insurance_done = {}
 
 # ===================================================================================== #
 #                                保存配置至 config.json                                 
 # ===================================================================================== #
 def save_settings(tc_threshold, custom_panel_override, cards=None, seat_number=None, dealer_upcard=None, all_cards=None, filename=CONFIG_PATH):
     try:
-        # 构建基础数据
         data = {
             "tc_threshold": tc_threshold,
             "custom_panel_override": custom_panel_override
         }
-        # 可选字段
+        
         if dealer_upcard is not None:
             data["dealer_upcard"] = dealer_upcard
         if seat_number is not None:
@@ -60,7 +61,6 @@ def save_settings(tc_threshold, custom_panel_override, cards=None, seat_number=N
         if all_cards is not None:
             data["all_cards"] = all_cards
 
-        # 写入配置文件
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:
@@ -130,33 +130,29 @@ def build_layout():
 #                                  MQTT 回调函数                                        
 # ===================================================================================== #
 def on_message(client, userdata, msg):
-    global qualified_tables, selected_table_name, has_auto_selected
+    global qualified_tables, selected_table_name, has_auto_selected, insurance_done
 
     topic = msg.topic
     payload = json.loads(msg.payload.decode())
 
-    # ========== 玩家决策推送（pp/decision/#） ==========
     if "decision" in topic:
         handle_decision_payload(topic, payload)
         return
 
-    # ========== 游戏结束推送（pp/gameend/#） ==========
     if "gameend" in topic:
         table_name = topic.split("/")[-1]
         is_game_ended[table_name] = True
+        insurance_done[table_name] = False
         return
 
-    # ========== 非 table / seat 推送一律忽略 ==========
     if not any(x in topic for x in ["table", "seat", "playerSeat"]):
         return
 
     table_name = topic.split("/")[-1]
 
-    # ========== 若是 playerSeat 推送，解除灰色状态 ==========
     if topic.startswith("pp/table/"):
         is_game_ended[table_name] = False
 
-    # ========== 抓取 TC 与洗牌标志 ==========
     tc_raw = payload.get("tc")
     try:
         tc = float(tc_raw)
@@ -165,7 +161,6 @@ def on_message(client, userdata, msg):
 
     cards = payload.get("cards", [])
 
-    # ========== 洗牌：cards 为空时 ==========
     if isinstance(cards, list) and len(cards) == 0:
         existing_data = mqtt_data.get(table_name, {})
         existing_names = existing_data.get("player_names", {})
@@ -187,10 +182,8 @@ def on_message(client, userdata, msg):
 
         return
 
-    # ========== 正常记录 MQTT 数据 ==========
     mqtt_data[table_name] = payload
 
-    # ========== 判断是否取消选中：只依赖玩家名是否还在 ==========
     existing_data = mqtt_data.get(table_name, {})
     current_players = existing_data.get("player_names", {})
     if (
@@ -199,7 +192,6 @@ def on_message(client, userdata, msg):
     ):
         selected_table_name = None
 
-    # ========== 自动选中匹配玩家名称所在桌（仅首次） ==========
     matching_tables = [
         tname for tname, pdata in mqtt_data.items()
         if custom_panel_override in pdata.get("player_names", {}).values()
@@ -212,7 +204,6 @@ def on_message(client, userdata, msg):
         selected_table_name = None
         has_auto_selected = False
 
-    # ========== 左侧筛选用合格表（不会影响右侧显示） ==========
     if tc is not None and tc >= tc_threshold:
         qualified_tables[table_name] = tc
     else:
@@ -291,7 +282,6 @@ def handle_decision_payload(topic, payload):
             all_cards=all_cards
         )
 
-        # 开启新线程运行 EV.py 后再读取结果
         threading.Thread(target=ev_runner_thread).start()
 
 # ===================================================================================== #
@@ -299,13 +289,14 @@ def handle_decision_payload(topic, payload):
 # ===================================================================================== #
 def ev_runner_thread():
     global matched_seat_score, matched_seat_ev
-    # 调用指定路径下的 EV.py
+
     subprocess.Popen(
         ["python", r"C:\WindowsOS\PP\EV.py"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
     time.sleep(1)
+
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -324,12 +315,10 @@ def ev_runner_thread():
 def update_layout(layout):
     global ev2_custom_rendered, matched_seat_score
 
-    # —— 左上：True Count 阈值显示 —— #
     layout["tc_input"].update(
         Panel(f"🎯 Current True Count Threshold 🎯 : [cyan]{tc_threshold:+.2f}[/cyan]", title="")
     )
 
-    # ✅ 修复关键：不再用 qualified_tables 控制右侧显示
     if not selected_table_name or selected_table_name not in mqtt_data:
         selected_name = "-"
         tc_display = "-"
@@ -346,7 +335,6 @@ def update_layout(layout):
         Panel(f"💬 Selected Table 💬 : [yellow]{selected_name}[/yellow]", title="")
     )
 
-    # —— 左中：True Count Value 与 Issued Cards —— #
     if selected_name in mqtt_data:
         current_tc = mqtt_data[selected_name].get("tc")
         current_issued = mqtt_data[selected_name].get("total")
@@ -368,7 +356,6 @@ def update_layout(layout):
         Layout(Panel(issued_str, title=""), name="issued_half")
     )
 
-    # —— 左侧合格桌列表 —— #
     table = Table(show_header=True, header_style="bold")
     table.add_column(" Index ", justify="center", style="white", width=6)
     table.add_column(" Qualified Blackjack Tables ", justify="center", style="white")
@@ -377,7 +364,6 @@ def update_layout(layout):
     table.add_column(" Time ", justify="center", style="white")
 
     for i, (name, val) in enumerate(qualified_tables.items(), start=1):
-        # 时间与已发牌数
         time_str = "-"
         issued = "-"
         if name in mqtt_data:
@@ -389,11 +375,9 @@ def update_layout(layout):
             if issued_val is not None:
                 issued = str(issued_val)
 
-        # TC 简单格式
         tc_val = mqtt_data.get(name, {}).get("tc")
         tc_str = f"{tc_val:+.2f}" if tc_val is not None else "-"
 
-        # 判断是否有空位
         player_names = mqtt_data.get(name, {}).get("player_names")
         if not isinstance(player_names, dict):
             has_vacancy = True
@@ -404,7 +388,6 @@ def update_layout(layout):
             ]
             has_vacancy = len(actual_players) < 7
 
-        # 如果有空位，桌名与 TC 同时标记绿色
         if has_vacancy:
             name_cell = f"[green]{name}[/green]"
             tc_cell   = f"[green]{tc_str}[/green]"
@@ -422,7 +405,6 @@ def update_layout(layout):
 
     layout["qualified"].update(Panel(table, title="", border_style="white"))
 
-    # ====== 决策 EV 面板判断 ======
     if custom_panel_override:
         player_names_check = mqtt_data.get(selected_name, {}).get("player_names", {})
         if custom_panel_override in player_names_check.values():
@@ -447,7 +429,6 @@ def update_layout(layout):
             )
         )
 
-    # ====== 玩家与庄家明细 ======
     if selected_name in mqtt_data:
         data = mqtt_data[selected_name]
         lines = []
@@ -490,7 +471,6 @@ def update_layout(layout):
 
     layout["details"].update(detail_panel)
 
-    # ====== 已出牌展示 ======
     if selected_name in mqtt_data:
         raw_cards = mqtt_data[selected_name].get("cards", [])
         converted = [
@@ -524,7 +504,6 @@ def update_layout(layout):
     if layout["cards_panel"].renderable != cards_panel:
         layout["cards_panel"].update(cards_panel)
 
-    # 清空 EV 图案（如果未渲染）
     if not ev2_custom_rendered:
         layout["ev2"].update(
             Panel(
@@ -560,7 +539,9 @@ def decision_logic(table_name, player_names, layout):
             matched_seat_index = seat_number - 1
 
             dealer_score = mqtt_data.get(table_name, {}).get("dealer", {}).get("score")
-            if dealer_score == "1/11":
+            if dealer_score == "1/11" and not insurance_done.get(table_name, False):
+                insurance_done[table_name] = True
+                threading.Thread(target=ev_runner_thread).start()
 
                 dealer_data = mqtt_data.get(table_name, {}).get("dealer", {}).get("cards", [])
                 dealer_upcard = dealer_data[0] if dealer_data else None
@@ -577,7 +558,6 @@ def decision_logic(table_name, player_names, layout):
                     dealer_upcard=dealer_upcard,
                     all_cards=all_cards
                 )
-                threading.Thread(target=ev_runner_thread).start()
                 time.sleep(0.5)
 
                 try:
@@ -591,11 +571,9 @@ def decision_logic(table_name, player_names, layout):
                         symbol = "🟥"
                         color = "bold red"
                     
-                    # 创建两行文本，每行都单独居中
                     line1 = Align.center(Text.from_markup(f"[{color}]{symbol} Insurance {symbol}[/{color}]"))
                     line2 = Align.center(Text.from_markup(f"[{color}][{insurance_ev:+.2f}][/{color}]"))
                     
-                    # 将两行组合成一个垂直布局
                     insurance_layout = Layout()
                     insurance_layout.split_column(
                         Layout(line1, size=2),
@@ -655,11 +633,9 @@ def decision_logic(table_name, player_names, layout):
                         ev_str = f"[{val:+.2f}]"
                         
                         if idx == 0:
-                            # 第一行：前后都带图标
                             formatted_dec = dec.ljust(max_dec_length)  
                             lines.append(f"[{color}]{symbol_char} {formatted_dec} {ev_str} {symbol_char}[/{color}]")
                         else:
-                            # 第二行和第三行：添加空格模拟图标宽度
                             padding = " " * (len(symbol_char) * 2 + 2)  
                             formatted_dec = dec.ljust(max_dec_length)
                             lines.append(f"[dim]{padding}{formatted_dec} {ev_str}[/dim]")
