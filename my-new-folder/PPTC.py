@@ -29,42 +29,63 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 # ===================================================================================== #
 mqtt_data = {}
 tc_threshold = -9
-is_game_ended = {}
 console = Console()
 qualified_tables = {}
-matched_seat_ev = None
 has_auto_selected = False
+selected_table_name = None
+custom_panel_override = None
+ev2_custom_rendered = False
 matched_seat_index = None
 matched_seat_score = None
-selected_table_name = None
-ev2_custom_rendered = False
-custom_panel_override = None
-
-insurance_done = {}
+matched_seat_ev = None
+is_game_ended = {}
+ev1_custom_rendered = False
+insurance_active = True
 
 # ===================================================================================== #
 #                                保存配置至 config.json                                 
 # ===================================================================================== #
-def save_settings(tc_threshold, custom_panel_override, cards=None, seat_number=None, dealer_upcard=None, all_cards=None, filename=CONFIG_PATH):
+def save_settings(
+    tc_threshold,
+    custom_panel_override,
+    cards=None,
+    seat_number=None,
+    dealer_upcard=None,
+    all_cards=None,
+    players=None,
+    seat_score=None,
+    filename=CONFIG_PATH
+):
+
     try:
         data = {
             "tc_threshold": tc_threshold,
             "custom_panel_override": custom_panel_override
         }
-        
-        if dealer_upcard is not None:
-            data["dealer_upcard"] = dealer_upcard
-        if seat_number is not None:
-            data["seat_number"] = seat_number
+
         if cards is not None:
             data["cards"] = cards
+
+        if seat_number is not None:
+            data["seat_number"] = seat_number
+
+        if dealer_upcard is not None:
+            data["dealer_upcard"] = dealer_upcard
+
         if all_cards is not None:
             data["all_cards"] = all_cards
 
+        if players is not None:
+            data["players"] = players
+
+        if seat_score is not None:
+            data["seat_score"] = seat_score
+
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+
     except Exception as e:
-        print(f"❌ Failed to save {filename}: {e}")
+        print(f"❌ Failed to save settings to {filename}: {e}")
 
 # ===================================================================================== #
 #                             加载 True Count 阈值与面板配置                            
@@ -130,29 +151,33 @@ def build_layout():
 #                                  MQTT 回调函数                                        
 # ===================================================================================== #
 def on_message(client, userdata, msg):
-    global qualified_tables, selected_table_name, has_auto_selected, insurance_done
+    global qualified_tables, selected_table_name, has_auto_selected
 
     topic = msg.topic
     payload = json.loads(msg.payload.decode())
 
+    # ========== 玩家决策推送（pp/decision/#） ==========
     if "decision" in topic:
         handle_decision_payload(topic, payload)
         return
 
+    # ========== 游戏结束推送（pp/gameend/#） ==========
     if "gameend" in topic:
         table_name = topic.split("/")[-1]
         is_game_ended[table_name] = True
-        insurance_done[table_name] = False
         return
 
+    # ========== 非 table / seat 推送一律忽略 ==========
     if not any(x in topic for x in ["table", "seat", "playerSeat"]):
         return
 
     table_name = topic.split("/")[-1]
 
+    # ========== 若是 playerSeat 推送，解除灰色状态 ==========
     if topic.startswith("pp/table/"):
         is_game_ended[table_name] = False
 
+    # ========== 抓取 TC 与洗牌标志 ==========
     tc_raw = payload.get("tc")
     try:
         tc = float(tc_raw)
@@ -161,6 +186,7 @@ def on_message(client, userdata, msg):
 
     cards = payload.get("cards", [])
 
+    # ========== 洗牌：cards 为空时 ==========
     if isinstance(cards, list) and len(cards) == 0:
         existing_data = mqtt_data.get(table_name, {})
         existing_names = existing_data.get("player_names", {})
@@ -182,8 +208,10 @@ def on_message(client, userdata, msg):
 
         return
 
+    # ========== 正常记录 MQTT 数据 ==========
     mqtt_data[table_name] = payload
 
+    # ========== 判断是否取消选中：只依赖玩家名是否还在 ==========
     existing_data = mqtt_data.get(table_name, {})
     current_players = existing_data.get("player_names", {})
     if (
@@ -192,6 +220,7 @@ def on_message(client, userdata, msg):
     ):
         selected_table_name = None
 
+    # ========== 自动选中匹配玩家名称所在桌（仅首次） ==========
     matching_tables = [
         tname for tname, pdata in mqtt_data.items()
         if custom_panel_override in pdata.get("player_names", {}).values()
@@ -204,6 +233,7 @@ def on_message(client, userdata, msg):
         selected_table_name = None
         has_auto_selected = False
 
+    # ========== 左侧筛选用合格表（不会影响右侧显示） ==========
     if tc is not None and tc >= tc_threshold:
         qualified_tables[table_name] = tc
     else:
@@ -251,10 +281,12 @@ async def input_loop():
             save_settings(tc_threshold, custom_panel_override)
 
 # ===================================================================================== #
-#                         处理玩家决策推送，保存至 config.json                           
+#                         处理玩家决策推送，保存至 config.json                            
 # ===================================================================================== #
 def handle_decision_payload(topic, payload):
-    global matched_seat_index, matched_seat_score, selected_table_name
+    global matched_seat_index, matched_seat_score, selected_table_name, insurance_active
+
+    insurance_active = False
 
     table_name = topic.split("/")[-1]
     seat = payload.get("seatNumber")
@@ -266,20 +298,22 @@ def handle_decision_payload(topic, payload):
         table_name == selected_table_name
     ):
         cards = payload.get("cards", [])
+        dealer_cards = mqtt_data.get(selected_table_name, {}) \
+                                 .get("dealer", {}) \
+                                 .get("cards", [])
+        dealer_upcard = dealer_cards[0] if dealer_cards else None
 
-        dealer_data = mqtt_data.get(selected_table_name, {}).get("dealer", {}).get("cards", [])
-        dealer_upcard = dealer_data[0] if dealer_data else None
-
-        all_cards_raw = mqtt_data.get(selected_table_name, {}).get("cards", [])
+        all_cards_raw = mqtt_data.get(selected_table_name, {}) \
+                                  .get("cards", [])
         all_cards = ["0" if str(c) == "10" else str(c) for c in all_cards_raw]
-
         save_settings(
             tc_threshold,
             custom_panel_override,
             cards=cards,
             seat_number=seat,
             dealer_upcard=dealer_upcard,
-            all_cards=all_cards
+            all_cards=all_cards,
+            players=mqtt_data.get(selected_table_name, {}).get("players", {})
         )
 
         threading.Thread(target=ev_runner_thread).start()
@@ -289,14 +323,13 @@ def handle_decision_payload(topic, payload):
 # ===================================================================================== #
 def ev_runner_thread():
     global matched_seat_score, matched_seat_ev
-
+    # 调用指定路径下的 EV.py
     subprocess.Popen(
         ["python", r"C:\WindowsOS\PP\EV.py"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
     time.sleep(1)
-
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -313,12 +346,14 @@ def ev_runner_thread():
 #                              Rich 动态内容刷新函数                                    
 # ===================================================================================== #
 def update_layout(layout):
-    global ev2_custom_rendered, matched_seat_score
+    global ev1_custom_rendered, ev2_custom_rendered, matched_seat_score
 
+    # —— 左上：True Count 阈值显示 —— #
     layout["tc_input"].update(
         Panel(f"🎯 Current True Count Threshold 🎯 : [cyan]{tc_threshold:+.2f}[/cyan]", title="")
     )
 
+    # ✅ 修复关键：不再用 qualified_tables 控制右侧显示
     if not selected_table_name or selected_table_name not in mqtt_data:
         selected_name = "-"
         tc_display = "-"
@@ -335,6 +370,7 @@ def update_layout(layout):
         Panel(f"💬 Selected Table 💬 : [yellow]{selected_name}[/yellow]", title="")
     )
 
+    # —— 左中：True Count Value 与 Issued Cards —— #
     if selected_name in mqtt_data:
         current_tc = mqtt_data[selected_name].get("tc")
         current_issued = mqtt_data[selected_name].get("total")
@@ -356,6 +392,7 @@ def update_layout(layout):
         Layout(Panel(issued_str, title=""), name="issued_half")
     )
 
+    # —— 左侧合格桌列表 —— #
     table = Table(show_header=True, header_style="bold")
     table.add_column(" Index ", justify="center", style="white", width=6)
     table.add_column(" Qualified Blackjack Tables ", justify="center", style="white")
@@ -364,6 +401,7 @@ def update_layout(layout):
     table.add_column(" Time ", justify="center", style="white")
 
     for i, (name, val) in enumerate(qualified_tables.items(), start=1):
+        # 时间与已发牌数
         time_str = "-"
         issued = "-"
         if name in mqtt_data:
@@ -375,9 +413,11 @@ def update_layout(layout):
             if issued_val is not None:
                 issued = str(issued_val)
 
+        # TC 简单格式
         tc_val = mqtt_data.get(name, {}).get("tc")
         tc_str = f"{tc_val:+.2f}" if tc_val is not None else "-"
 
+        # 判断是否有空位
         player_names = mqtt_data.get(name, {}).get("player_names")
         if not isinstance(player_names, dict):
             has_vacancy = True
@@ -388,6 +428,7 @@ def update_layout(layout):
             ]
             has_vacancy = len(actual_players) < 7
 
+        # 如果有空位，桌名与 TC 同时标记绿色
         if has_vacancy:
             name_cell = f"[green]{name}[/green]"
             tc_cell   = f"[green]{tc_str}[/green]"
@@ -405,6 +446,7 @@ def update_layout(layout):
 
     layout["qualified"].update(Panel(table, title="", border_style="white"))
 
+    # ====== 决策 EV 面板判断 ======
     if custom_panel_override:
         player_names_check = mqtt_data.get(selected_name, {}).get("player_names", {})
         if custom_panel_override in player_names_check.values():
@@ -429,6 +471,7 @@ def update_layout(layout):
             )
         )
 
+    # ====== 玩家与庄家明细 ======
     if selected_name in mqtt_data:
         data = mqtt_data[selected_name]
         lines = []
@@ -471,6 +514,7 @@ def update_layout(layout):
 
     layout["details"].update(detail_panel)
 
+    # ====== 已出牌展示 ======
     if selected_name in mqtt_data:
         raw_cards = mqtt_data[selected_name].get("cards", [])
         converted = [
@@ -504,21 +548,25 @@ def update_layout(layout):
     if layout["cards_panel"].renderable != cards_panel:
         layout["cards_panel"].update(cards_panel)
 
+    # 清空 EV 面板（如果未渲染）
+    if not ev1_custom_rendered:
+        layout["ev1"].update(
+            Panel(
+                Align.center(Text("🂫 Blackjack 🂡", style="dim"), vertical="middle"),
+                title=None,
+                border_style="white"
+            )
+        )
+    
     if not ev2_custom_rendered:
         layout["ev2"].update(
             Panel(
-                Align.center(Text("🂫 Pragmatic Play 🂡", style="dim"), vertical="middle")
+                Align.center(Text("🂫 Pragmatic Play 🂡", style="dim"), vertical="middle"),
+                title=None,
+                border_style="white"
             )
         )
-    ev2_custom_rendered = False
-
-    layout["ev1"].update(
-        Panel(
-            Align.center(Text("🂫 Blackjack 🂡", style="dim"), vertical="middle"),
-            title=None,
-            border_style="white"
-        )
-    )
+    
     layout["ev3"].update(
         Panel(
             Align.center(Text("🂫 Blackjack 🂡", style="dim"), vertical="middle"),
@@ -530,127 +578,148 @@ def update_layout(layout):
 # ===================================================================================== #
 #         决策逻辑：匹配玩家名称并更新 EV 区块（图案和内容随决策一起变色）            
 # ===================================================================================== #
+# ===================================================================================== #
+#         决策逻辑：匹配玩家名称并更新 EV 区块（图案和内容随决策一起变色）            
+# ===================================================================================== #
 def decision_logic(table_name, player_names, layout):
-    global ev2_custom_rendered, matched_seat_index, matched_seat_score, matched_seat_ev
+    global ev1_custom_rendered, ev2_custom_rendered, insurance_active
+    global matched_seat_index, matched_seat_score, matched_seat_ev
 
     for seat_str, name in player_names.items():
-        if name == custom_panel_override:
-            seat_number = int(seat_str)
-            matched_seat_index = seat_number - 1
+        if name != custom_panel_override:
+            continue
 
-            dealer_score = mqtt_data.get(table_name, {}).get("dealer", {}).get("score")
-            if dealer_score == "1/11" and not insurance_done.get(table_name, False):
-                insurance_done[table_name] = True
-                threading.Thread(target=ev_runner_thread).start()
+        seat_number       = int(seat_str)
+        matched_seat_index = seat_number - 1
 
-                dealer_data = mqtt_data.get(table_name, {}).get("dealer", {}).get("cards", [])
-                dealer_upcard = dealer_data[0] if dealer_data else None
-                all_cards_raw = mqtt_data.get(table_name, {}).get("cards", [])
-                all_cards = ["0" if str(c) == "10" else str(c) for c in all_cards_raw]
-                player_data = mqtt_data.get(table_name, {}).get("players", {}).get(seat_str, {})
-                player_cards = player_data.get("cards", [])
+        dealer_score = mqtt_data.get(table_name, {}).get("dealer", {}).get("score")
 
-                save_settings(
-                    tc_threshold,
-                    custom_panel_override,
-                    cards=player_cards,
-                    seat_number=seat_number,
-                    dealer_upcard=dealer_upcard,
-                    all_cards=all_cards
+        # —— 保险分支：只有庄家 A（"1/11"）且 insurance_active=True 才执行 —— #
+        if dealer_score == "1/11" and insurance_active:
+            # 保存保险分支数据
+            dealer_cards  = mqtt_data[table_name]["dealer"].get("cards", [])
+            dealer_upcard = dealer_cards[0] if dealer_cards else None
+            all_cards_raw = mqtt_data[table_name].get("cards", [])
+            all_cards     = ["0" if str(c) == "10" else str(c) for c in all_cards_raw]
+
+            player_key   = f"{seat_str}_h0"
+            player_data  = mqtt_data[table_name]["players"].get(player_key, {})
+            player_cards = player_data.get("cards", [])
+            player_score = player_data.get("score")
+
+            save_settings(
+                tc_threshold,
+                custom_panel_override,
+                cards=player_cards,
+                seat_number=seat_number,
+                dealer_upcard=dealer_upcard,
+                all_cards=all_cards,
+                players=mqtt_data[table_name]["players"],
+                seat_score=player_score
+            )
+            threading.Thread(target=ev_runner_thread).start()
+            time.sleep(0.5)
+
+            # 渲染保险 EV 到 ev1 面板
+            try:
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    insurance_ev = float(json.load(f)
+                                        .get("ev_result", {})
+                                        .get("insurance_ev", 0))
+                symbol = "🟩" if insurance_ev >= 0 else "🟥"
+                color  = "bold green" if insurance_ev >= 0 else "bold red"
+
+                line1 = Align.center(Text.from_markup(
+                    f"[{color}]{symbol} Insurance {symbol}[/{color}]"
+                ))
+                line2 = Align.center(Text.from_markup(
+                    f"[{color}][{insurance_ev:+.4f}][/{color}]"
+                ))
+
+                insurance_layout = Layout()
+                insurance_layout.split_column(
+                    Layout(line1, size=2),
+                    Layout(line2, size=1)
                 )
-                time.sleep(0.5)
-
-                try:
-                    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                        insurance_ev = float(data.get("insurance_ev", 0))
-                    if insurance_ev >= 0:
-                        symbol = "🟩"
-                        color = "bold green"
-                    else:
-                        symbol = "🟥"
-                        color = "bold red"
-                    
-                    line1 = Align.center(Text.from_markup(f"[{color}]{symbol} Insurance {symbol}[/{color}]"))
-                    line2 = Align.center(Text.from_markup(f"[{color}][{insurance_ev:+.2f}][/{color}]"))
-                    
-                    insurance_layout = Layout()
-                    insurance_layout.split_column(
-                        Layout(line1, size=2),
-                        Layout(line2, size=1)
+                layout["ev1"].update(Panel(insurance_layout))
+            except Exception as e:
+                print(f"[❌ Insurance EV 读取失败] {e}")
+                layout["ev1"].update(
+                    Panel(
+                        Align.center(Text("🂫 Blackjack 🂡", style="dim"),
+                                     vertical="middle"),
+                        title=None,
+                        border_style="white"
                     )
-                    
-                    layout["ev2"].update(
-                        Panel(insurance_layout)
-                    )
-                    ev2_custom_rendered = True
-                except Exception as e:
-                    print(f"[❌ Insurance EV 读取失败] {e}")
-                    layout["ev2"].update(
-                        Panel(Align.center(Text("🂫 Pragmatic Play 🂡", style="dim"), vertical="middle"))
-                    )
-                return
-
-            if not matched_seat_score or matched_seat_score == "-":
-                layout["ev2"].update(
-                    Panel(Align.center(Text("🂫 Pragmatic Play 🂡", style="dim"), vertical="middle"))
                 )
+
+            ev1_custom_rendered = True
+            return
+
+        # —— 基本策略 ev2 渲染 —— #
+        if not matched_seat_score or matched_seat_score == "-":
+            layout["ev2"].update(
+                Panel(Align.center(
+                    Text("🂫 Pragmatic Play 🂡", style="dim"),
+                    vertical="middle"
+                ))
+            )
+        else:
+            decision = matched_seat_score.upper()
+            if decision == "HIT":
+                color, symbol = "bold green", "🟩"
+            elif decision == "STAND":
+                color, symbol = "bold red",   "🟥"
+            elif decision == "DOUBLE":
+                color, symbol = "bold orange3","🟧"
+            elif decision == "SPLIT":
+                color, symbol = "bold deepskyblue1","🟦"
             else:
-                decision = matched_seat_score.upper()
-                if decision == "HIT":
-                    color = "bold green"
-                    symbol = "🟩"
-                elif decision == "STAND":
-                    color = "bold red"
-                    symbol = "🟥"
-                elif decision == "DOUBLE":
-                    color = "bold orange3"
-                    symbol = "🟧"
-                elif decision == "SPLIT":
-                    color = "bold deepskyblue1"
-                    symbol = "🟦"
-                else:
-                    color = "bold white"
-                    symbol = "⬜"
+                color, symbol = "bold white","⬜"
 
-                try:
-                    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                        evr = json.load(f).get("ev_result", {})
-                    ev_items = [
-                        (dec.upper(), val)
-                        for dec, val in evr.items()
-                        if dec not in ("type", "best") and isinstance(val, (int, float))
-                    ]
-                    ev_items.sort(key=lambda x: x[1], reverse=True)
-                    ev_items = ev_items[:3]
+            try:
+                evr = json.load(open(CONFIG_PATH, "r", encoding="utf-8"))\
+                            .get("ev_result", {})
+                ev_items = [
+                    (dec.upper(), val)
+                    for dec, val in evr.items()
+                    if dec not in ("type", "best") and isinstance(val, (int, float))
+                ]
+                ev_items.sort(key=lambda x: x[1], reverse=True)
+                ev_items = ev_items[:3]
 
-                    symbol_map = {"HIT": "🟩", "STAND": "🟥", "DOUBLE": "🟧", "SPLIT": "🟦"}
-
-                    lines = []
-                    max_dec_length = max(len(dec) for dec, _ in ev_items)  
-                    for idx, (dec, val) in enumerate(ev_items):
-                        symbol_char = symbol_map.get(dec, '⬜')  
-                        ev_str = f"[{val:+.2f}]"
-                        
-                        if idx == 0:
-                            formatted_dec = dec.ljust(max_dec_length)  
-                            lines.append(f"[{color}]{symbol_char} {formatted_dec} {ev_str} {symbol_char}[/{color}]")
-                        else:
-                            padding = " " * (len(symbol_char) * 2 + 2)  
-                            formatted_dec = dec.ljust(max_dec_length)
-                            lines.append(f"[dim]{padding}{formatted_dec} {ev_str}[/dim]")
-
-                    debug_text = "\n".join(lines)
-                except Exception:
-                    ev_str = f"{matched_seat_ev:+.2f}" if matched_seat_ev is not None else ""
-                    debug_text = f"{symbol} {matched_seat_score} {f'[ {ev_str} ]' if ev_str else ''} {symbol}"
-
-                layout["ev2"].update(
-                    Panel(Align.center(Text.from_markup(debug_text), vertical="middle"))
+                symbol_map = {"HIT":"🟩","STAND":"🟥","DOUBLE":"🟧","SPLIT":"🟦"}
+                max_len = max(len(dec) for dec, _ in ev_items)
+                lines = []
+                for idx, (dec, val) in enumerate(ev_items):
+                    symbol_char = symbol_map.get(dec, '⬜')
+                    ev_text     = f"{val:+.4f}"
+                    formatted   = dec.ljust(max_len)
+                    if idx == 0:
+                        lines.append(
+                            f"[{color}]{symbol_char}{formatted} [{ev_text}]{symbol_char}[/{color}]"
+                        )
+                    else:
+                        lines.append(
+                            f"[dim] {formatted} [{ev_text}][/dim]"
+                        )
+                debug_text = "\n".join(lines)
+            except Exception:
+                ev_display = (
+                    f"{matched_seat_ev:+.2f}"
+                    if matched_seat_ev is not None else ""
                 )
-                ev2_custom_rendered = True
+                debug_text = f"{symbol} {matched_seat_score} {f'[ {ev_display} ]' if ev_display else ''} {symbol}"
 
-            break
+            layout["ev2"].update(
+                Panel(Align.center(
+                    Text.from_markup(debug_text),
+                    vertical="middle"
+                ))
+            )
+            ev2_custom_rendered = True
+
+        break
 
 # ===================================================================================== #
 #                                 主异步循环函数                                       
