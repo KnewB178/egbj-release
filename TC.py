@@ -85,6 +85,8 @@ def on_message(client, userdata, msg):
     if topic == MQTT_TOPIC_TC:
         arr = sstr.split("<|>")
         table_name, tc = arr[0], arr[1]
+        table_name = table_name.replace("Japanese", "Japan")
+        
         try:
             tc_value = float(tc)
         except ValueError:
